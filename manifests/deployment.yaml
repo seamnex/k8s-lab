@@ -22,12 +22,27 @@ spec:
       labels:
         app: demo-api
     spec:
+      # Techo para el apagado: tiene que ser mayor que el sleep del preStop
+      # (10s) mas lo que tarde nginx en cerrar. Si el preStop lo excede,
+      # kubelet manda SIGKILL igual y perdes la ventana que querias ganar.
+      terminationGracePeriodSeconds: 30
       containers:
         - name: demo-api
           image: nginx:1.27-alpine
           ports:
             - containerPort: 80
               name: http
+          # El fix del experimento 2. Cuando un pod entra en Terminating,
+          # kubelet arranca el apagado y el endpoint-controller lo saca del
+          # Service EN PARALELO, no en orden. Durante esa ventana kube-proxy
+          # sigue mandando trafico a un nginx que ya cerro el listener: eso
+          # son los codigos 000 (conexion rechazada), no 5xx.
+          # El sleep no hace nada util salvo lo unico que importa: retrasar
+          # el SIGTERM hasta que la baja del Service ya se propago.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
           resources:
             requests:
               cpu: 50m

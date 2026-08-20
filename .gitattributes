@@ -1,0 +1,9 @@
+# Los scripts de shell se checkoutean SIEMPRE con LF, incluso en Windows.
+# Con core.autocrlf=true un clon en Windows los convierte a CRLF, y bash
+# falla con `bad interpreter: /usr/bin/env bash^M` — un error que no dice
+# nada sobre su causa real y se pierden horas buscándolo.
+*.sh text eol=lf
+
+# YAML: los validadores del CI corren en Linux.
+*.yaml text eol=lf
+*.yml text eol=lf

@@ -1,0 +1,69 @@
+# Valida los manifiestos en cada push y PR a main.
+#
+# La idea es atrapar acá lo que de otro modo se descubre con un `kubectl apply`
+# fallido — o peor, con uno que aplica algo sintácticamente válido y
+# semánticamente equivocado.
+#
+# Dos capas, porque atrapan cosas distintas:
+#
+#   yamllint     -> el YAML está bien formado (indentación, duplicados, tabs).
+#                   No sabe nada de Kubernetes.
+#   kubeconform  -> el recurso valida contra el esquema OpenAPI de Kubernetes.
+#                   Detecta campos inexistentes y apiVersions equivocadas.
+#
+# Lo que NINGUNA de las dos detecta: que el manifiesto haga lo correcto. Un
+# `minAvailable: 3` sobre 3 réplicas pasa las dos validaciones y deja el nodo
+# imposible de drenar. El lint es un piso, no una revisión.
+
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Solo lectura: este workflow no escribe nada en el repo.
+permissions:
+  contents: read
+
+jobs:
+  manifiestos:
+    name: Manifiestos de Kubernetes
+    runs-on: ubuntu-24.04
+
+    env:
+      KUBECONFORM_VERSION: v0.8.0
+      # Verificado contra el archivo CHECKSUMS del release.
+      KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+      # Versión del cluster donde corre el lab.
+      K8S_VERSION: "1.31.0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Instalar yamllint
+        run: pip install --disable-pip-version-check yamllint==1.35.1
+
+      - name: Validar el formato YAML
+        # --strict eleva los warnings a error: un warning que nadie mira
+        # es exactamente lo mismo que no tener el lint.
+        run: yamllint --strict manifests/
+
+      - name: Instalar kubeconform
+        # Versión pineada y checksum verificado. Descargar un binario por su
+        # tag `latest` y ejecutarlo sin chequear nada es la vía de entrada
+        # clásica a un ataque de cadena de suministro en CI.
+        run: |
+          curl -sSLo kubeconform.tar.gz \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  kubeconform.tar.gz" | sha256sum -c -
+          tar xzf kubeconform.tar.gz kubeconform
+          ./kubeconform -v
+
+      - name: Validar contra el esquema de Kubernetes
+        # -strict rechaza campos que no existen en el esquema. Sin esta bandera
+        # un `readinesProbe` mal tipeado pasa el lint, se aplica sin protestar
+        # y el pod se queda sin probe: el manifiesto miente y nadie se entera.
+        run: ./kubeconform -strict -summary -kubernetes-version "${K8S_VERSION}" manifests/

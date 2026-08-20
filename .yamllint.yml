@@ -1,0 +1,32 @@
+# Configuración de yamllint para los manifiestos.
+#
+# Parte del preset `default` y afloja solo lo que en manifiestos de Kubernetes
+# genera ruido sin aportar. Cada excepción está justificada: una regla apagada
+# "porque molestaba" es deuda que después nadie sabe si se puede volver a prender.
+extends: default
+
+rules:
+  # Los manifiestos tienen comentarios explicativos largos y campos como las
+  # imágenes con digest que no se pueden cortar. 100 es un límite que se puede
+  # sostener; 80 obligaría a partir líneas que se leen peor partidas.
+  line-length:
+    max: 100
+    level: error
+
+  # `kubectl` no necesita el `---` inicial y los manifiestos del lab son de un
+  # solo documento cada uno. Se exige explícitamente su ausencia para que no
+  # aparezca a veces sí y a veces no.
+  document-start:
+    present: false
+
+  # En Kubernetes `on:`, `yes` y `no` son nombres de campo o valores legítimos
+  # en algunos contextos; la advertencia de valores booleanos implícitos no
+  # aplica a lo que escribimos acá.
+  truthy:
+    allowed-values: ["true", "false"]
+
+  # Las listas indentadas bajo su clave se leen mejor y es el estilo de la
+  # documentación oficial de Kubernetes.
+  indentation:
+    spaces: 2
+    indent-sequences: true

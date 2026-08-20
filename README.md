@@ -1,5 +1,7 @@
 # Kubernetes Lab — Resiliencia traducida a operaciones
 
+[![lint](https://github.com/seamnex/k8s-lab/actions/workflows/lint.yml/badge.svg)](https://github.com/seamnex/k8s-lab/actions/workflows/lint.yml)
+
 Cluster local donde rompo aplicaciones a propósito para entender **qué mecanismo de
 Kubernetes evita cuál incidente**.
 
@@ -25,6 +27,72 @@ para observar la reacción del cluster. La pregunta que guía cada prueba:
 **"si esto pasara en producción, ¿el usuario se entera?"**
 
 Spoiler de los resultados: en dos de los cinco experimentos, **sí se entera**.
+
+---
+
+## El cluster
+
+```mermaid
+flowchart TB
+    subgraph nodo ["Nodo — desktop-control-plane (12 CPU · 13,6 GiB)"]
+        subgraph dep ["Deployment demo-api · RollingUpdate maxUnavailable=1 maxSurge=1"]
+            P1["Pod<br/>nginx:alpine<br/>readiness + liveness<br/>preStop 10 s"]
+            P2["Pod<br/>nginx:alpine<br/>readiness + liveness<br/>preStop 10 s"]
+            P3["Pod<br/>nginx:alpine<br/>readiness + liveness<br/>preStop 10 s"]
+        end
+        SVC["Service demo-api<br/>ClusterIP + NodePort 30080"]
+        PDB["PodDisruptionBudget<br/>minAvailable: 2<br/><br/>bloquea evicciones<br/>que dejen menos de 2"]
+        SONDA["Pod sonda<br/>~5 req/s"]
+    end
+
+    SONDA -->|"http://demo-api"| SVC
+    SVC -->|"solo pods READY"| P1
+    SVC --> P2
+    SVC --> P3
+    PDB -.-> dep
+
+    classDef gobierno stroke-dasharray:5 5
+    class PDB gobierno
+```
+
+La sonda corre **dentro** del cluster a propósito: es la única forma de ejercitar
+el balanceo real del Service. Desde el host, el NodePort no llega y un
+`port-forward` se ata a un solo pod, que es justo lo que no querés medir.
+
+## El ciclo de vida del pod — dónde se pierden las peticiones
+
+El detalle que explica los `000` del experimento 2: cuando un pod entra en
+`Terminating`, la baja del Service y el apagado del contenedor arrancan **en
+paralelo**. Nadie los ordena.
+
+```mermaid
+sequenceDiagram
+    participant API as API Server
+    participant EP as EndpointSlice controller
+    participant KP as kube-proxy
+    participant KL as kubelet
+    participant N as nginx
+
+    API->>API: pod marcado Terminating
+
+    par Camino A — baja del balanceo
+        API->>EP: quitar el pod del EndpointSlice
+        EP->>KP: propagar cambio
+        KP->>KP: reescribir reglas de ruteo
+    and Camino B — apagado del contenedor
+        API->>KL: iniciar terminación
+        KL->>N: preStop (si existe)
+        KL->>N: SIGTERM
+        N->>N: cierra el listener
+    end
+
+    Note over KP,N: SIN preStop los dos caminos corren a la par:<br/>si B termina antes que A, kube-proxy sigue<br/>mandando tráfico a un socket cerrado → 000
+    Note over KL,N: CON preStop, B espera 10 s.<br/>A siempre gana. La ventana se cierra.
+```
+
+Lo importante: `preStop` **no** hace nada útil por sí mismo. `sleep 10` no repara
+nada. Lo único que hace —y es lo único que hace falta— es darle ventaja al camino
+A. Es una carrera, y el hook la amaña.
 
 ---
 
@@ -106,6 +174,13 @@ kubectl set image deployment/demo-api demo-api=nginx:1.28-alpine
 kubectl rollout status deployment/demo-api
 ```
 
+O automatizado, que es como salieron los números de la bitácora — levanta la sonda,
+dispara el rollout y devuelve la distribución de códigos:
+
+```bash
+./scripts/medir_rollout.sh nginx:1.28-alpine
+```
+
 **Qué observar:** ¿aparece algún código distinto de 200? Prestá atención a los `000`
 (fallo de conexión), no solo a los 5xx.
 **Equivalente operativo:** la ventana de mantenimiento nocturna que deja de ser necesaria.
@@ -180,6 +255,80 @@ Disponibilidad medida con un pod sonda interno a ~5 req/s contra el Service.
 | 4 | Readiness/liveness | **12,4 s** salir del balanceo · **21,6 s** al reinicio · **26,5 s** recuperado | **Sí** — 21 de 155 en 403 (13,5 %) | El pod roto siguió sirviendo errores los 12 s que tardó la readiness en detectarlo |
 | 5 | Sin capacidad | n/a | No | 50 réplicas entraron sin Pending; el límite recién apareció pidiendo 20 CPU: `Insufficient cpu` |
 
+---
+
+## El fix: cerrar la ventana del experimento 2
+
+El experimento 2 perdió el 2,4 % de las peticiones con código `000`. La hipótesis
+del diagnóstico era la carrera del diagrama de arriba. Un diagnóstico sin
+contraprueba es una corazonada, así que lo medí como A/B en la misma sesión y el
+mismo cluster: mismo Service, misma sonda, mismo salto de imagen, alternando
+únicamente el hook.
+
+```bash
+./scripts/medir_rollout.sh nginx:1.28-alpine
+```
+
+**Entorno:** Docker Desktop 29.6.2 · Kubernetes v1.36.1 · nodo único · sonda
+interna a ~5 req/s. **Fecha:** 20/08/2026.
+
+| Configuración | Corrida | Peticiones | Fallos (`000`) | Tasa |
+|---|---|---|---|---|
+| Sin `preStop` | 19/08 (bitácora original) | 127 | 3 | 2,36 % |
+| Sin `preStop` | A/B #1 | 149 | 2 | 1,34 % |
+| Sin `preStop` | A/B #2 | 149 | 3 | 2,01 % |
+| **Sin `preStop`** | **acumulado** | **425** | **8** | **1,88 %** |
+| Con `preStop` | A/B #1 | 159 | 0 | 0,00 % |
+| Con `preStop` | A/B #2 | 158 | 0 | 0,00 % |
+| **Con `preStop`** | **acumulado** | **317** | **0** | **0,00 %** |
+
+Cero fallos en 317 peticiones contra 8 en 425. La hipótesis se sostiene: **eran
+peticiones ruteadas a un listener ya cerrado**, y bastó con retrasar el SIGTERM.
+
+Dos honestidades sobre este número. La primera: 317 peticiones a 5 req/s es una
+muestra chica; "0,00 %" acá significa "no lo reproduje más", no "es imposible".
+La segunda: el rollout pasó de ~12 s a ~13 s. **El cero downtime se pagó con
+deploys más lentos**, y con 3 réplicas es imperceptible, pero sobre 200 pods esos
+10 segundos por tanda son la diferencia entre un deploy de minutos y uno de horas.
+
+### El PDB no arregla esto — y ese es el punto
+
+Es el error conceptual que más vi repetido, y lo verifiqué en vez de asumirlo:
+**el PodDisruptionBudget no interviene en un rolling update.** Durante un deploy
+quien gobierna la disponibilidad es `maxUnavailable` del Deployment; el PDB ni se
+consulta. El PDB solo actúa sobre **disrupciones voluntarias**, las que pasan por
+la Eviction API: `kubectl drain`, mantenimiento de nodo, el cluster autoscaler.
+
+La comprobación, evictando dos pods seguidos con `minAvailable: 2` sobre 3 réplicas:
+
+```bash
+kubectl get pdb demo-api
+# NAME       MIN AVAILABLE   ALLOWED DISRUPTIONS
+# demo-api   2               1
+
+P1=$(kubectl get pod -l app=demo-api -o jsonpath='{.items[0].metadata.name}')
+kubectl create --raw "/api/v1/namespaces/default/pods/$P1/eviction" -f - <<EOF
+{"apiVersion":"policy/v1","kind":"Eviction","metadata":{"name":"$P1"}}
+EOF
+# {"kind":"Status","status":"Success","code":201}
+
+# la segunda, inmediata, sobre otro pod:
+# Error from server (TooManyRequests): Cannot evict pod as it would
+# violate the pod's disruption budget.
+```
+
+`429 TooManyRequests` es el PDB haciendo exactamente su trabajo: frenar al
+operador —o al autoscaler— que iba a dejar el servicio en una sola réplica.
+**Cubre un vector real que el lab no estaba probando, pero no es el fix del 2,4 %.**
+Atribuirle a los dos mecanismos la misma mejora sería contar la historia linda en
+lugar de la verdadera.
+
+> **La trampa del PDB.** Con `minAvailable: 2` sobre 3 réplicas hay un caso
+> patológico: si alguien baja el Deployment a 2 réplicas, el PDB pasa a permitir
+> **cero** disrupciones y el nodo no se puede drenar nunca. El drain queda colgado
+> y el mantenimiento se cae. Por eso `minAvailable` en porcentaje (`"50%"`) suele
+> envejecer mejor que un entero.
+
 ## Qué me llevo de este lab
 
 **1. "Rolling update sin downtime" es una configuración, no una propiedad.**
@@ -189,6 +338,14 @@ Service y el cierre del proceso ocurren **en paralelo**, no en orden. Durante es
 el kube-proxy todavía manda tráfico a un nginx que ya cerró el listener. Se corrige con
 un `preStop` que duerma unos segundos antes de que el contenedor empiece a apagarse.
 El default no lo trae, así que el "cero downtime" hay que construirlo.
+
+**Confirmado el 20/08:** con el hook, 0 fallos en 317 peticiones contra 8 en 425 sin él.
+Pero lo que más me llevo no es el fix, es que **el diagnóstico se podía verificar**.
+Tenía una explicación coherente del `000` y podría haberla dejado escrita como
+conclusión; en cambio la convertí en una predicción falsable —"si es la carrera,
+el hook la elimina"— y la probé alternando una sola variable. En un postmortem esa
+diferencia es todo: la causa raíz que nadie contrastó es una hipótesis con buena
+prensa, y se termina cerrando el incidente con una acción correctiva que no corrige nada.
 
 **2. El deploy fallido no fue una caída, fue una degradación silenciosa.**
 En el experimento 3 el servicio nunca dejó de responder: 184 de 184 peticiones en 200.
@@ -228,20 +385,62 @@ decidir quien escribe el YAML sin hablar con quien conoce la curva de tráfico.
 
 ## Próximos pasos
 
-- [ ] Agregar un `preStop` hook y re-correr el experimento 2 para confirmar que los `000` desaparecen
+- [x] Agregar un `preStop` hook y re-correr el experimento 2 para confirmar que los `000` desaparecen — **0 de 317**
+- [x] Sumar un `PodDisruptionBudget` y ver cómo cambia el comportamiento — bloquea la 2ª evicción con `429`
 - [ ] Probar `failureThreshold: 2` en la readiness y medir cuánto baja la ventana de 12,4 s
-- [ ] Sumar un `PodDisruptionBudget` y ver cómo cambia el comportamiento en el experimento 5
 - [ ] Configurar alertas sobre `availableReplicas < desiredReplicas` — el hallazgo del experimento 3
+- [ ] Repetir el A/B del `preStop` a 50 req/s: 317 peticiones son pocas para afirmar "cero"
+- [ ] Medir cuánto se alarga el rollout con 20 réplicas — el costo de los 10 s por tanda
 
 ---
+
+## Validación automática
+
+Cada push y cada PR a `main` pasan por
+[`.github/workflows/lint.yml`](.github/workflows/lint.yml), con dos capas que
+atrapan cosas distintas:
+
+| Herramienta | Qué valida | Qué deja pasar |
+|---|---|---|
+| `yamllint --strict` | YAML bien formado: indentación, claves duplicadas, tabs | Cualquier campo inventado — no sabe qué es Kubernetes |
+| `kubeconform -strict` | El recurso contra el esquema OpenAPI de K8s | Errores de criterio: la configuración válida pero equivocada |
+
+La división importa y la comprobé con un caso a propósito: si escribís
+`readinesProbe` en vez de `readinessProbe`, **yamllint pasa sin decir nada**
+—es YAML perfectamente válido— y kubeconform lo rechaza con
+`additional properties 'readinesProbe' not allowed`. Sin el `-strict`, ni
+siquiera él lo detecta: el campo se ignora, el manifiesto se aplica y el pod
+queda sin readiness probe. El YAML dice una cosa y el cluster hace otra.
+
+Reproducir el lint localmente:
+
+```bash
+pip install yamllint==1.35.1
+yamllint --strict manifests/
+
+# kubeconform, con la versión pineada del workflow
+kubeconform -strict -summary -kubernetes-version 1.31.0 manifests/
+```
+
+> **Lo que el lint no puede hacer.** `minAvailable: 3` sobre 3 réplicas pasa las
+> dos validaciones y deja el nodo imposible de drenar para siempre. Ningún
+> validador de esquema atrapa una decisión operativa equivocada, y confundir
+> "el CI está verde" con "el manifiesto está bien" es cómo se llega a ese
+> incidente.
 
 ## Estructura
 
 ```
 k8s-lab/
+├── .github/workflows/
+│   └── lint.yml            # yamllint + kubeconform en cada push/PR a main
+├── .yamllint.yml           # reglas de formato, con cada excepción justificada
 ├── manifests/
-│   ├── deployment.yaml     # 3 réplicas, probes, límites, estrategia de rollout
+│   ├── deployment.yaml     # 3 réplicas, probes, límites, rollout, preStop
+│   ├── pdb.yaml            # PodDisruptionBudget minAvailable: 2
 │   └── service.yaml        # NodePort 30080
+├── scripts/
+│   └── medir_rollout.sh    # sonda interna + distribución de códigos del rollout
 └── README.md
 ```
 

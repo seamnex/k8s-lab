@@ -1,0 +1,21 @@
+# PodDisruptionBudget: piso de capacidad durante disrupciones VOLUNTARIAS.
+#
+# Que cubre:  kubectl drain, mantenimiento de nodo, cluster autoscaler,
+#             cualquier cosa que pase por la Eviction API.
+# Que NO cubre: los rolling updates (ahi manda maxUnavailable del Deployment,
+#             el PDB ni se consulta) ni las caidas de nodo (involuntarias).
+#
+# minAvailable: 2 sobre 3 replicas = se puede evacuar de a un pod por vez.
+# Ojo con el caso patologico: si alguna vez ponen replicas=2, este PDB
+# bloquea el drain por completo y el nodo no se puede vaciar nunca.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: demo-api
+  labels:
+    app: demo-api
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: demo-api
